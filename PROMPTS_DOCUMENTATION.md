@@ -1101,3 +1101,182 @@ NO = Agent should continue working"""
 
 ---
 
+## 4. Content Processing Prompts
+
+These prompts are used for extracting and processing information from web pages.
+
+### 4.1 Content Extraction Prompt
+
+**Purpose**: Extracts relevant information from webpage markdown content based on a user query. This prompt guides the LLM to filter through webpage content and extract only information relevant to the query.
+
+**Used By**: `extract()` action in `browser_use/tools/service.py`
+
+**When Used**: When the agent uses the `extract` action to gather structured information from a webpage
+
+**File Location**: Inline in `browser_use/tools/service.py` (lines 724-743)
+
+**Key Features**:
+- Filters noise and advertising content from webpage
+- Extracts only query-relevant information
+- Handles truncated content with continuation support
+- Prevents hallucination (only use available information)
+- Direct output format (non-conversational)
+
+**Input Parameters**:
+- `query`: User's information query
+- `content`: Filtered markdown content from webpage
+- `stats_summary`: Content statistics and truncation info
+
+**Prompt**:
+
+```python
+system_prompt = """
+You are an expert at extracting data from the markdown of a webpage.
+
+<input>
+You will be given a query and the markdown of a webpage that has been filtered to remove noise and advertising content.
+</input>
+
+<instructions>
+- You are tasked to extract information from the webpage that is relevant to the query.
+- You should ONLY use the information available in the webpage to answer the query. Do not make up information or provide guess from your own knowledge.
+- If the information relevant to the query is not available in the page, your response should mention that.
+- If the query asks for all items, products, etc., make sure to directly list all of them.
+- If the content was truncated and you need more information, note that the user can use start_from_char parameter to continue from where truncation occurred.
+</instructions>
+
+<output>
+- Your output should present ALL the information relevant to the query in a concise way.
+- Do not answer in conversational format - directly output the relevant information or that the information is unavailable.
+</output>
+""".strip()
+
+# User prompt format:
+prompt = f'<query>\n{query}\n</query>\n\n<content_stats>\n{stats_summary}\n</content_stats>\n\n<webpage_content>\n{content}\n</webpage_content>'
+```
+
+---
+
+### 4.2 Element Finding Prompt
+
+**Purpose**: Finds specific DOM elements on a page using natural language descriptions. This enables the actor API to locate elements without requiring precise CSS selectors.
+
+**Used By**: `get_element_by_prompt()` method in `browser_use/actor/page.py`
+
+**When Used**: When users use the actor API to find elements by description instead of selectors
+
+**File Location**: Inline in `browser_use/actor/page.py` (lines 418-441)
+
+**Key Features**:
+- Uses indexed interactive elements format
+- Returns element index or None
+- Requires reasoning before selection
+- Understands element hierarchy (parent-child relationships)
+
+**Input Parameters**:
+- Browser state with indexed interactive elements
+- User prompt describing the element to find
+
+**Prompt**:
+
+```python
+system_message = SystemMessage(
+	content="""You are an AI created to find an element on a page by a prompt.
+
+<browser_state>
+Interactive Elements: All interactive elements will be provided in format as [index]<type>text</type> where
+- index: Numeric identifier for interaction
+- type: HTML element type (button, input, etc.)
+- text: Element description
+
+Examples:
+[33]<div>User form</div>
+[35]<button aria-label='Submit form'>Submit</button>
+
+Note that:
+- Only elements with numeric indexes in [] are interactive
+- (stacked) indentation (with \t) is important and means that the element is a (html) child of the element above (with a lower index)
+- Pure text elements without [] are not interactive.
+</browser_state>
+
+Your task is to find an element index (if any) that matches the prompt (written in <prompt> tag).
+
+If non of the elements matches the, return None.
+
+Before you return the element index, reason about the state and elements for a sentence or two."""
+)
+
+# User message format:
+state_message = UserMessage(
+	content=f"""<browser_state>
+{llm_representation}
+</browser_state>
+
+<prompt>
+{prompt}
+</prompt>"""
+)
+```
+
+---
+
+## 5. Prompt Management Infrastructure
+
+### 5.1 SystemPrompt Class
+
+**Purpose**: Manages loading and formatting of system prompts from markdown files.
+
+**File Location**: `browser_use/agent/prompts.py`
+
+**Key Methods**:
+- `load_system_message()`: Loads appropriate system prompt based on configuration (thinking, flash mode, Anthropic optimization)
+- `_load_content()`: Reads markdown file and formats it
+- `_is_anthropic()`: Detects Anthropic model provider
+
+**Configuration Options**:
+- `use_thinking`: Enable/disable thinking block in output (default: True)
+- `flash_mode`: Use ultra-condensed prompt for fast models (default: False)
+- `max_actions`: Maximum actions per step (injected into prompt)
+- `override_system_message`: Replace default prompt entirely
+- `extend_system_message`: Add custom instructions to default prompt
+
+### 5.2 AgentMessagePrompt Class
+
+**Purpose**: Constructs user messages with complete browser state, history, and context for each agent step.
+
+**File Location**: `browser_use/agent/prompts.py`
+
+**Key Methods**:
+- `get_message()`: Builds complete user message with:
+  - Agent history (previous steps, evaluations, memories)
+  - Agent state (user request, file system, todos, step info)
+  - Browser state (URL, tabs, indexed elements, content)
+  - Browser vision (screenshot with bounding boxes)
+  - Read state (one-time data from extract/read_file actions)
+
+**Input Components**:
+- `state`: Current browser state with indexed elements
+- `result`: Previous step results
+- `include_screenshot`: Whether to include visual information
+- File system context
+- Todo list contents
+
+---
+
+## Summary
+
+The browser-use library employs a sophisticated multi-prompt architecture:
+
+1. **Agent System Prompts** (4 variants): Core decision-making logic with optimization for different model capabilities
+2. **Code-Use Agent Prompt**: Alternative code-generation approach for complex automation
+3. **Evaluation Prompts**: Quality assessment and task completion validation
+4. **Content Processing Prompts**: Information extraction and element finding
+
+All prompts are designed to be:
+- **Modular**: Easy to customize via override/extend parameters
+- **Optimized**: Different variants for different model capabilities
+- **Structured**: Clear input/output formats with examples
+- **Robust**: Handle edge cases, errors, and impossible tasks
+
+For implementation details, see the respective files in the `browser_use/` directory.
+
