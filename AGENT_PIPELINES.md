@@ -361,3 +361,497 @@ Cell N+1 Context
 
 ---
 
+## 3. Extract Action Pipeline
+
+The content extraction pipeline that retrieves relevant information from webpages.
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        EXTRACT ACTION CALLED                          │
+│                     extract(query: str, ...)                          │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 1: GET PAGE CONTENT                        │
+    ├──────────────────────────────────────────────────┤
+    │  • Capture full DOM state                        │
+    │  • Convert HTML → Markdown (markdownify)         │
+    │  • Get page statistics:                          │
+    │    - Total characters                            │
+    │    - Number of elements                          │
+    │    - Content type                                │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 2: FILTER CONTENT                          │
+    ├──────────────────────────────────────────────────┤
+    │  • Apply content filters:                        │
+    │    - Remove ads (common ad selectors)            │
+    │    - Remove tracking scripts                     │
+    │    - Remove navigation menus                     │
+    │    - Remove footers/headers                      │
+    │  • Truncate if needed:                           │
+    │    - Max 100K characters by default              │
+    │    - Support start_from_char for continuation    │
+    │  • Calculate filter statistics                   │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 3: BUILD EXTRACTION PROMPT                 │
+    ├──────────────────────────────────────────────────┤
+    │  System Prompt:                                  │
+    │  ├─ "You are an expert at extracting data..."   │
+    │  ├─ Input description                            │
+    │  ├─ Instructions (no hallucination, list all)    │
+    │  └─ Output format (concise, direct)              │
+    │                                                   │
+    │  User Prompt:                                    │
+    │  ├─ <query>{user_query}</query>                  │
+    │  ├─ <content_stats>{statistics}</content_stats>  │
+    │  └─ <webpage_content>{filtered_md}</...>         │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 4: CALL LLM FOR EXTRACTION                 │
+    ├──────────────────────────────────────────────────┤
+    │  • Send system + user messages to LLM            │
+    │  • LLM extracts relevant information             │
+    │  • Returns extracted data as text                │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 5: RETURN RESULT                           │
+    ├──────────────────────────────────────────────────┤
+    │  Return ActionResult:                            │
+    │  ├─ extracted_content: str (LLM response)        │
+    │  ├─ is_done: False                               │
+    │  ├─ include_in_memory: True (show in read_state) │
+    │  └─ metadata: statistics                         │
+    └──────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+**Extraction System Prompt** (inline in `tools/service.py`)
+
+**Data Flow:**
+```
+Current Page DOM → Markdown → Filtered Content → LLM → Extracted Data → ActionResult
+                                                                              ↓
+                                                        Visible in <read_state> in next step
+```
+
+### Configuration Options
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `query` | Required | What information to extract |
+| `max_chars` | 100000 | Max content length to send to LLM |
+| `start_from_char` | 0 | For paginated extraction |
+
+---
+
+## 4. Judge Evaluation Pipeline
+
+The post-execution evaluation pipeline that assesses agent performance.
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                         EVALUATION TRIGGERED                          │
+│           (After agent.run() completes or during testing)            │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 1: COLLECT EXECUTION DATA                  │
+    ├──────────────────────────────────────────────────┤
+    │  • Original task description                     │
+    │  • Final result returned to user                 │
+    │  • Agent trajectory (all steps):                 │
+    │    - Step N: evaluation, memory, next_goal       │
+    │    - Actions taken                               │
+    │    - Action results                              │
+    │  • Screenshots (last N images, default 10)       │
+    │  • Ground truth (if provided)                    │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 2: FORMAT TRAJECTORY                       │
+    ├──────────────────────────────────────────────────┤
+    │  • Format agent steps as text:                   │
+    │    "Step 1:                                      │
+    │     Evaluation: [...]                            │
+    │     Memory: [...]                                │
+    │     Next Goal: [...]                             │
+    │     Actions: [...]                               │
+    │     Results: [...]"                              │
+    │  • Truncate if needed (max 40K chars each)       │
+    │  • Encode screenshots to base64                  │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 3: BUILD JUDGE PROMPT                      │
+    ├──────────────────────────────────────────────────┤
+    │  System Message:                                 │
+    │  ├─ Evaluation framework                         │
+    │  ├─ Ground truth section (if provided)           │
+    │  ├─ Primary criteria (5 levels)                  │
+    │  ├─ Verdict guidelines (true/false)              │
+    │  ├─ Failure conditions                           │
+    │  ├─ Impossible task detection                    │
+    │  ├─ CAPTCHA detection                            │
+    │  └─ Response format (JSON schema)                │
+    │                                                   │
+    │  User Message:                                   │
+    │  ├─ <task>{original_task}</task>                 │
+    │  ├─ <ground_truth>{...}</ground_truth> (if any)  │
+    │  ├─ <agent_trajectory>{steps}</agent_trajectory> │
+    │  ├─ <final_result>{output}</final_result>        │
+    │  └─ [Screenshot 1, Screenshot 2, ...]            │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 4: CALL LLM FOR EVALUATION                 │
+    ├──────────────────────────────────────────────────┤
+    │  • Send messages to LLM                          │
+    │  • LLM analyzes entire trajectory + screenshots  │
+    │  • Returns structured JSON evaluation            │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 5: PARSE EVALUATION                        │
+    ├──────────────────────────────────────────────────┤
+    │  Parse JSON response:                            │
+    │  {                                               │
+    │    "reasoning": "Detailed analysis...",          │
+    │    "verdict": true or false,                     │
+    │    "failure_reason": "Why it failed..." | "",    │
+    │    "impossible_task": true or false,             │
+    │    "reached_captcha": true or false              │
+    │  }                                               │
+    │  Return JudgementResult                          │
+    └──────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+**Judge System Prompt** (inline in `agent/judge.py`)
+- Comprehensive evaluation framework
+- 5-level criteria hierarchy
+- Ground truth validation (highest priority)
+- Examples of success/failure scenarios
+- Structured JSON output format
+
+### Ground Truth Priority
+
+When ground truth is provided, the evaluation follows this priority:
+```
+1. Ground Truth Validation (HIGHEST PRIORITY)
+   ↓ If satisfied
+2. Task Satisfaction
+   ↓ If satisfied
+3. Output Quality
+   ↓ If satisfied
+4. Tool Effectiveness
+   ↓ If satisfied
+5. Browser Handling
+
+Final Verdict: true/false
+```
+
+---
+
+## 5. Task Completion Validation Pipeline
+
+Quick validation check to determine if CodeAgent should continue working.
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    VALIDATION CHECK TRIGGERED                         │
+│         (After each CodeAgent execution when max_validations > 0)    │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 1: BUILD VALIDATION PROMPT                 │
+    ├──────────────────────────────────────────────────┤
+    │  User Message (no system prompt):                │
+    │  ├─ "You are a task completion validator..."    │
+    │  ├─ **Original Task:** {user_task}               │
+    │  ├─ **Agent's Output:** {current_output}         │
+    │  ├─ **Your Task:** Determine if complete         │
+    │  ├─ Consider:                                    │
+    │  │   1. Has agent delivered what was requested?  │
+    │  │   2. Is there actual data (if extraction)?    │
+    │  │   3. Is task truly impossible?                │
+    │  │   4. Can agent make meaningful progress?      │
+    │  └─ **Response Format:**                         │
+    │      Reasoning: [analysis]                       │
+    │      Verdict: [YES or NO]                        │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 2: CALL LLM                                │
+    ├──────────────────────────────────────────────────┤
+    │  • Send user message (no system, no history)     │
+    │  • LLM analyzes task vs output                   │
+    │  • Returns text with Reasoning + Verdict         │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 3: PARSE VERDICT                           │
+    ├──────────────────────────────────────────────────┤
+    │  • Extract reasoning from response               │
+    │  • Look for "Verdict: YES" or "Verdict: NO"      │
+    │  • Return (is_complete: bool, reasoning: str)    │
+    │                                                   │
+    │  YES = Task complete OR impossible               │
+    │  NO = Should continue working                    │
+    └──────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+**Validation Prompt** (inline in `code_use/namespace.py`)
+- Simple task completion check
+- No system prompt (lightweight)
+- YES/NO format
+
+### Decision Flow
+
+```
+Agent Output → Validation → YES → Stop execution, return result
+                         → NO → Continue to next cell
+```
+
+---
+
+## 6. Element Finding Pipeline
+
+Find DOM elements by natural language description (Actor API).
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                   get_element_by_prompt(prompt) CALLED                │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 1: GET CURRENT PAGE STATE                  │
+    ├──────────────────────────────────────────────────┤
+    │  • Get serialized DOM with indexed elements      │
+    │  • Format as LLM representation:                 │
+    │    [123]<button>Submit</button>                  │
+    │    [124]<input type="text">Name</input>          │
+    │    [125]<a href="...">Next</a>                   │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 2: BUILD ELEMENT FINDING PROMPT            │
+    ├──────────────────────────────────────────────────┤
+    │  System Message:                                 │
+    │  ├─ "You are an AI created to find elements..."  │
+    │  ├─ <browser_state> format explanation           │
+    │  ├─ Task: find element matching prompt           │
+    │  ├─ Return None if no match                      │
+    │  └─ Reason before returning index                │
+    │                                                   │
+    │  User Message:                                   │
+    │  ├─ <browser_state>{indexed_elements}</...>      │
+    │  └─ <prompt>{user_description}</prompt>          │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 3: CALL LLM                                │
+    ├──────────────────────────────────────────────────┤
+    │  • LLM analyzes elements vs description          │
+    │  • Reasons about matches                         │
+    │  • Returns element index or None                 │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 4: PARSE & RETURN                          │
+    ├──────────────────────────────────────────────────┤
+    │  • Extract index from response                   │
+    │  • Validate index exists in DOM                  │
+    │  • Return DOMInteractedElement or None           │
+    └──────────────────────────────────────────────────┘
+```
+
+### Prompts Used
+
+**Element Finding Prompt** (inline in `actor/page.py`)
+- Browser state format documentation
+- Element hierarchy explanation
+- Reasoning requirement
+
+### Use Cases
+
+```python
+# Instead of:
+element = page.get_element_by_selector('button.submit-btn')
+
+# Use natural language:
+element = await page.get_element_by_prompt('the submit button at the bottom')
+```
+
+---
+
+## Summary: Pipeline Comparison
+
+| Pipeline | Trigger | Prompts | Input | Output | Use Case |
+|----------|---------|---------|-------|--------|----------|
+| **Standard Agent** | `agent.run()` | System prompt (4 variants) + message construction | Task, browser state, history | AgentOutput (actions) | Main browser automation |
+| **Code-Use Agent** | `code_agent.run()` | Code-use system prompt | Task, browser state, namespace | Python code cells | Complex data extraction |
+| **Extract Action** | `extract(query)` | Extraction system prompt | Query, page content | Extracted information | Page data extraction |
+| **Judge Evaluation** | `construct_judge_messages()` | Judge system prompt | Task, trajectory, screenshots | JudgementResult | Performance evaluation |
+| **Task Validation** | CodeAgent validation | Validation prompt | Task, current output | YES/NO verdict | Completion check |
+| **Element Finding** | `get_element_by_prompt()` | Element finding prompt | Description, DOM state | Element index | Natural language element selection |
+
+## Prompt Selection Decision Tree
+
+```
+┌─────────────────────────────────────────┐
+│      Which agent are you using?        │
+└─────────────────────────────────────────┘
+         ↓                    ↓
+    Standard Agent      Code-Use Agent
+         ↓                    ↓
+    Flash mode?         code_use/system_prompt.md
+    ↓YES    ↓NO             + Optional validation prompt
+    │       │
+    │       Use thinking?
+    │       ↓YES    ↓NO
+    │       │       │
+    Anthropic?  system_prompt.md  system_prompt_no_thinking.md
+    ↓YES  ↓NO
+    │     │
+flash_anthropic.md  system_prompt_flash.md
+```
+
+---
+
+## Advanced: Message Construction Details
+
+### Standard Agent Message Format (Each Step)
+
+```python
+messages = [
+    # Message 1: System Prompt
+    SystemMessage(content=selected_system_prompt_text),
+    
+    # Message 2: Complete Context
+    UserMessage(content=[
+        # Text Part 1: Agent History
+        ContentPartTextParam(text="""
+<agent_history>
+<step_1>
+Evaluation: {prev_evaluation}
+Memory: {prev_memory}
+Next Goal: {prev_goal}
+Actions: {prev_actions}
+Results: {prev_results}
+</step_1>
+...
+</agent_history>
+        """),
+        
+        # Text Part 2: Agent State
+        ContentPartTextParam(text="""
+<agent_state>
+<user_request>{original_task}</user_request>
+<file_system>{file_summary}</file_system>
+<todo_contents>{todo_md_content}</todo_contents>
+<step_info>{current_step}/{max_steps}</step_info>
+</agent_state>
+        """),
+        
+        # Text Part 3: Browser State
+        ContentPartTextParam(text="""
+<browser_state>
+Current URL: {url}
+Open Tabs: {tabs}
+Interactive Elements:
+{indexed_elements}
+</browser_state>
+        """),
+        
+        # Image Part: Screenshot (if use_vision=True)
+        ContentPartImageParam(image_url={
+            'url': 'data:image/png;base64,...',
+            'media_type': 'image/png'
+        }),
+        
+        # Text Part 4: Read State (if extract/read_file was called)
+        ContentPartTextParam(text="""
+<read_state>
+{one_time_data_from_last_extract_or_read}
+</read_state>
+        """)
+    ])
+]
+```
+
+### Code-Use Agent Message Format (Each Cell)
+
+```python
+messages = [
+    # Message 1: System Prompt
+    SystemMessage(content=code_use_system_prompt_text),
+    
+    # Message 2-N: Previous cells (history)
+    UserMessage(content="Previous cell code"),
+    AssistantMessage(content="Previous cell output"),
+    
+    # Message N+1: Current context
+    UserMessage(content=f"""
+User Task: {original_task}
+
+Current Browser State:
+{dom_with_indices}
+
+Loading Status: {pending_requests}
+
+Previous Cell Output:
+{stdout_from_last_cell}
+
+Write the next code cell to continue the task.
+    """)
+]
+```
+
+---
+
+## Event Bus Integration
+
+All pipelines integrate with the event bus for observability:
+
+```
+Agent Events:
+├─ CreateAgentSessionEvent (agent initialization)
+├─ CreateAgentTaskEvent (task start)
+├─ CreateAgentStepEvent (each step)
+├─ UpdateAgentTaskEvent (task completion)
+└─ CreateAgentOutputFileEvent (file generation)
+
+Browser Events:
+├─ BrowserStateUpdateEvent (DOM changes)
+├─ ScreenshotCapturedEvent (screenshot taken)
+├─ DownloadEvent (file downloaded)
+└─ NavigationEvent (page navigation)
+
+Tool Events:
+├─ ActionExecutedEvent (action completion)
+├─ ActionErrorEvent (action failure)
+└─ ExtractCompleteEvent (extraction done)
+```
+
+---
+
+*For implementation details, refer to the source files mentioned in each pipeline section.*
+
