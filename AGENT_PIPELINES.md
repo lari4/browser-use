@@ -186,3 +186,178 @@ Step N+1 Input Context
 
 ---
 
+## 2. Code-Use Agent Pipeline
+
+The alternative code-generation based agent that writes Python code in a Jupyter-like notebook environment.
+
+### Architecture Overview
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                      CODE AGENT INITIALIZATION                        │
+├──────────────────────────────────────────────────────────────────────┤
+│  1. Load Code-Use System Prompt (from system_prompt.md)              │
+│  2. Initialize Browser Session                                       │
+│  3. Initialize Namespace (execution environment)                     │
+│  4. Pre-import libraries (json, asyncio, csv, re, datetime, etc.)    │
+│  5. Inject tool functions (navigate, click, evaluate, etc.)          │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+┌──────────────────────────────────────────────────────────────────────┐
+│                     CELL-BY-CELL EXECUTION LOOP                       │
+│                    (Like Jupyter: write → execute → next)            │
+└──────────────────────────────────────────────────────────────────────┘
+                              ↓
+        ╔═══════════════════════════════════════════════╗
+        ║           SINGLE CELL EXECUTION                ║
+        ╚═══════════════════════════════════════════════╝
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 1: BUILD CONTEXT                           │
+    ├──────────────────────────────────────────────────┤
+    │  • Get current browser state:                    │
+    │    - URL and DOM (compressed, indexed)           │
+    │    - Loading status (pending network requests)   │
+    │    - Element markers ([i_123] format)            │
+    │    - Shadow DOM, iframes, scroll containers      │
+    │  • Get execution environment status:             │
+    │    - Persisted variables from previous cells     │
+    │    - Error count (8 consecutive errors = stop)   │
+    │    - Current working files                       │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 2: CALL LLM FOR CODE GENERATION            │
+    ├──────────────────────────────────────────────────┤
+    │  INPUT:                                           │
+    │  ├─ System Prompt (code_use/system_prompt.md)    │
+    │  ├─ User Task (original request)                 │
+    │  ├─ Previous Cell Output (if any)                │
+    │  ├─ Current Browser State (DOM snapshot)         │
+    │  ├─ Available Tools (functions reference)        │
+    │  └─ Execution History (previous cells)           │
+    │                                                   │
+    │  OUTPUT:                                          │
+    │  ├─ [1-2 sentences]: reasoning about prev step   │
+    │  ├─ [1-2 sentences]: plan for next step          │
+    │  └─ Code Cell:                                    │
+    │      ```python                                    │
+    │      # Python code to execute                    │
+    │      print(results)                               │
+    │      ```                                          │
+    │  OR Multi-block:                                  │
+    │      ```js extract_products`                      │
+    │      (function(){ ... })()                        │
+    │      ```                                          │
+    │      ```python                                    │
+    │      products = await evaluate(extract_products) │
+    │      ```                                          │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 3: PARSE & EXTRACT CODE BLOCKS             │
+    ├──────────────────────────────────────────────────┤
+    │  • Extract Python code block(s)                  │
+    │  • Extract named non-Python blocks:              │
+    │    - ```js name` → saved as string variable      │
+    │    - ```markdown name` → saved as string         │
+    │    - ```bash name` → saved as string             │
+    │  • Validate syntax (basic checks)                │
+    │  • Check for forbidden patterns (global keyword) │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 4: EXECUTE CODE IN NAMESPACE               │
+    ├──────────────────────────────────────────────────┤
+    │  • Inject named blocks as variables              │
+    │  • Execute Python code in persistent namespace   │
+    │  • Available functions:                          │
+    │    - await navigate(url)                         │
+    │    - await click(index=N)                        │
+    │    - await input_text(index=N, text=str)         │
+    │    - await evaluate(js_code, variables=dict)     │
+    │    - await get_selector_from_index(index=N)      │
+    │    - await scroll(down=bool, pages=float)        │
+    │    - await done(text=str, success=bool, files=[])│
+    │  • Capture stdout/stderr                         │
+    │  • Track execution errors                        │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 5: COLLECT EXECUTION RESULTS               │
+    ├──────────────────────────────────────────────────┤
+    │  • Capture output:                               │
+    │    - Print statements → stdout                   │
+    │    - Return values → result                      │
+    │    - Exceptions → error message                  │
+    │  • Update browser state (after actions)          │
+    │  • Track variable changes in namespace           │
+    │  • Check for done() call (task completion)       │
+    └──────────────────────────────────────────────────┘
+                              ↓
+    ┌──────────────────────────────────────────────────┐
+    │  STEP 6: VALIDATE & CONTINUE                     │
+    ├──────────────────────────────────────────────────┤
+    │  • If done() was called:                         │
+    │    → Optionally validate with LLM               │
+    │    → Return final result                         │
+    │  • If error occurred:                            │
+    │    → Increment error counter                     │
+    │    → If 8 consecutive errors → terminate         │
+    │  • If max steps reached → terminate              │
+    │  • Otherwise → continue to next cell             │
+    └──────────────────────────────────────────────────┘
+                              ↓
+                  ┌─────────────────────┐
+                  │   Continue loop?    │
+                  └─────────────────────┘
+                    ↓YES          ↓NO (done/errors/max_steps)
+             [Next Cell]      [Task Complete]
+```
+
+### Prompts Used
+
+**System Prompt:** `browser_use/code_use/system_prompt.md`
+- Jupyter-like execution model instructions
+- Tool documentation (navigate, click, evaluate, etc.)
+- JavaScript patterns (IIFE, no comments, no backticks)
+- Pagination strategies (URL first, then buttons)
+- 5-phase execution flow (Exploration → Validation → Batch → Cleanup → Done)
+- Complete working examples
+
+**Optional Validation Prompt:** Task Completion Validation (see [Pipeline 5](#5-task-completion-validation-pipeline))
+
+### Data Flow Between Cells
+
+```
+Cell N-1 Code
+├─ Python code executed
+└─ Output captured (prints, variables, errors)
+         ↓
+Cell N Context
+├─ Previous Cell Output (stdout/stderr)
+├─ Updated Browser State (after actions)
+├─ Persisted Variables (namespace state)
+└─ Error History (consecutive errors)
+         ↓
+Cell N LLM Call → Cell N Code Generated
+         ↓
+Cell N Execution → Cell N Output
+         ↓
+Cell N+1 Context
+```
+
+### Key Differences from Standard Agent
+
+| Aspect | Standard Agent | Code-Use Agent |
+|--------|---------------|----------------|
+| **Output Format** | JSON actions | Python code |
+| **Execution** | Action registry | Direct code execution |
+| **State** | Agent history | Jupyter-like namespace |
+| **Tool Access** | Indirect via actions | Direct function calls |
+| **Flexibility** | Predefined actions only | Arbitrary Python logic |
+| **Error Handling** | Action validation | Runtime exceptions |
+| **Memory** | Structured fields | Variables in namespace |
+
+---
+
